@@ -2,14 +2,26 @@ import "fmt"
 import "gpio"
 
 # read the switch on pin 0; gpio.pin polls and sends a new event on each change
-$b = gpio.pin(0)
+$b0 = gpio.pin(0)
+#$b11 = gpio.pin(11)
 
-file "/tmp/pin0" {
-	state => "exists",
-	content => fmt.printf("value: %t\n", $b),
+#file "/tmp/pin0" {
+#	state => "exists",
+#	content => fmt.printf("value: %t\n", $b),
+#}
+
+#gpio "led1" { # XXX: name should be dev+pin or just dev for uniqueness?
+#	pin => 1,
+#	value => $b0,
+#}
+
+gpio "led2" {
+	pin => 2,
+	#value => not $b11,
+	value => $b0,
 }
 
-#gpio "led1" { # XXX: name should be dev+pin ?
-#	pin => 1,
-#	value => $b,
+#gpio "led3" {
+#	pin => 3,
+#	value => not $b0 and not $b11,
 #}

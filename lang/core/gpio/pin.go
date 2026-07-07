@@ -66,8 +66,10 @@ func init() {
 // whenever that level changes, for example when a button or switch wired to the
 // pin is pressed or released.
 //
-// It is read-only: it never changes any pin's direction or output. The pin must
-// already be configured as an input, which is the chip's power-on default.
+// To be able to sense the external level, it configures the watched pin as an
+// input (the chip's power-on default for a pin is actually an output, so this is
+// required, just as button.py sets its button pin to an input). It never drives
+// an output or touches any other pin.
 type PinFunc struct {
 	interfaces.Textarea
 
@@ -165,6 +167,15 @@ func (obj *PinFunc) Stream(ctx context.Context) error {
 			p := pin
 			obj.pin = &p
 			obj.last = nil
+
+			// The pin only senses the external level when it is an
+			// input; the chip defaults a pin to an output, which
+			// would just read back its own latch and never change.
+			// This is the one state change we make, and only to the
+			// pin we were asked to read. SetDirection is idempotent.
+			if err := obj.aw.SetDirection(pin, false); err != nil {
+				return errwrap.Wrapf(err, "could not set pin to input")
+			}
 
 		case <-ticker.C:
 			// time to poll again
