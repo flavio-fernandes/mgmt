@@ -1,0 +1,26 @@
+
+tmate
+curl -fsSL https://claude.ai/install.sh | bash
+apt install -y git
+
+sudo apt install software-properties-common -y
+sudo add-apt-repository ppa:longsleep/golang-backports
+sudo apt update
+sudo apt install golang-go
+
+git clone https://github.com/purpleidea/mgmt.git
+cd mgmt/
+apt install -y libvirt-dev libaugeas-dev
+make
+
+pip install -q adafruit-blinka
+pip install adafruit-circuitpython-aw9523
+pip install hidapi
+
+--
+
+./mgmt run --tmp-prefix lang examples/lang/gpio2.mcl
+
+watch -n0.2 cat /tmp/pin0
+sudo ./mgmt --debug run --tmp-prefix lang examples/lang/gpio2.mcl
+
