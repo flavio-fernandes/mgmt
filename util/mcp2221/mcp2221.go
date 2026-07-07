@@ -82,23 +82,63 @@ func unrecoverable(state byte) bool {
 
 // MCP2221 represents an open connection to a single bridge device. It is safe
 // for concurrent use; each I2C transaction is serialized with a mutex.
+//
+// A single physical bridge is a single shared bus: overlapping transactions
+// from two independent handles would corrupt each other. To prevent this, Open
+// returns one shared handle per device path, and all callers of that path share
+// this struct (and therefore its mutex), so every transaction across the whole
+// process is serialized onto the bus.
 type MCP2221 struct {
 	f  *os.File
-	mu sync.Mutex
+	mu sync.Mutex // serializes I2C transactions on this bus
+
+	device string // hidraw path; also the registry key
+	refs   int    // number of open handles sharing us, guarded by registryMu
 }
 
-// Open opens the bridge at the given hidraw device path. Pass DefaultDevice for
-// the common case of a single attached chip.
+// registry holds the shared handle for each device path so that a resource and
+// a function (or any two callers) end up on the same serialized bus.
+var (
+	registryMu sync.Mutex
+	registry   = map[string]*MCP2221{}
+)
+
+// Open opens the bridge at the given hidraw device path, or returns the existing
+// shared handle if that path is already open. Pass DefaultDevice for the common
+// case of a single attached chip. Each successful Open must be paired with one
+// Close.
 func Open(device string) (*MCP2221, error) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	if obj, exists := registry[device]; exists {
+		obj.refs++ // hand back the shared handle
+		return obj, nil
+	}
+
 	f, err := os.OpenFile(device, os.O_RDWR, 0)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "could not open mcp2221 device")
 	}
-	return &MCP2221{f: f}, nil
+	obj := &MCP2221{f: f, device: device, refs: 1}
+	registry[device] = obj
+	return obj, nil
 }
 
-// Close releases the underlying device handle.
+// Close releases this handle. The underlying device is only really closed once
+// the last handle sharing it has been closed.
 func (obj *MCP2221) Close() error {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	if obj.refs <= 0 {
+		return nil // already fully closed; ignore a double Close
+	}
+	obj.refs--
+	if obj.refs > 0 {
+		return nil // still in use by another handle
+	}
+	delete(registry, obj.device)
 	return obj.f.Close()
 }
 
