@@ -49,6 +49,10 @@ const chipID = 0x23
 // Pins is the number of GPIO pins the chip exposes.
 const Pins = 16
 
+// PinsPerPort is the number of pins on each of the chip's two I2C ports. Port 0
+// is pins 0..7 and port 1 is pins 8..15.
+const PinsPerPort = 8
+
 // AW9523 register addresses. The input, output and config registers are 16 bit
 // (little endian): register 0 covers pins 0..7, the next covers pins 8..15.
 const (
@@ -115,10 +119,10 @@ func (obj *AW9523) Reset() error {
 	return obj.writeReg8(regReset, 0x00)
 }
 
-// Init confirms the chip is present, resets it, puts port 0 into push-pull mode
-// and configures every pin as an input. This mirrors the Adafruit driver's
-// power-on setup. Call it once before using the chip.
-func (obj *AW9523) Init() error {
+// CheckID reads the chip's ID register and returns an error if it does not match
+// the expected AW9523 value. This is a read-only presence check that does not
+// modify any chip state.
+func (obj *AW9523) CheckID() error {
 	id, err := obj.ChipID()
 	if err != nil {
 		return errwrap.Wrapf(err, "could not read chip id")
@@ -126,22 +130,40 @@ func (obj *AW9523) Init() error {
 	if id != chipID {
 		return fmt.Errorf("unexpected chip id 0x%02x, expected 0x%02x", id, chipID)
 	}
-	if err := obj.Reset(); err != nil {
-		return errwrap.Wrapf(err, "could not reset chip")
-	}
-	// Set port 0 to push-pull (GCR bit 4) without disturbing other bits.
+	return nil
+}
+
+// GetPort0PushPull reports whether port 0 (pins 0..7) is in push-pull output
+// mode. It is read-only.
+func (obj *AW9523) GetPort0PushPull() (bool, error) {
 	gcr, err := obj.readReg8(regGCR)
 	if err != nil {
-		return errwrap.Wrapf(err, "could not read gcr")
+		return false, err
 	}
-	if err := obj.writeReg8(regGCR, gcr|(1<<4)); err != nil {
-		return errwrap.Wrapf(err, "could not set push-pull mode")
+	return gcr&(1<<4) != 0, nil
+}
+
+// SetPort0PushPull enables or disables push-pull output mode for all of port 0
+// (pins 0..7) via the GCR register. Port 1 (pins 8..15) is always open-drain and
+// is unaffected. Push-pull is required for a port 0 output to actively drive a
+// pin high, for example to source current into an LED. This only changes the
+// port's drive mode; it does not alter any pin's direction or output value, and
+// it leaves the other GCR bits untouched.
+func (obj *AW9523) SetPort0PushPull(pushPull bool) error {
+	gcr, err := obj.readReg8(regGCR)
+	if err != nil {
+		return err
 	}
-	// All pins as inputs (config bit set == input).
-	if err := obj.writeReg16(regConfig, 0xFFFF); err != nil {
-		return errwrap.Wrapf(err, "could not set directions")
+	next := gcr
+	if pushPull {
+		next |= 1 << 4
+	} else {
+		next &^= 1 << 4
 	}
-	return nil
+	if next == gcr {
+		return nil
+	}
+	return obj.writeReg8(regGCR, next)
 }
 
 // validatePin returns an error if pin is out of range.
@@ -150,6 +172,20 @@ func validatePin(pin int) error {
 		return fmt.Errorf("pin %d out of range (0..%d)", pin, Pins-1)
 	}
 	return nil
+}
+
+// GetDirection reports whether a pin is currently configured as an output. It is
+// read-only.
+func (obj *AW9523) GetDirection(pin int) (bool, error) {
+	if err := validatePin(pin); err != nil {
+		return false, err
+	}
+	cur, err := obj.readReg16(regConfig)
+	if err != nil {
+		return false, err
+	}
+	// A set config bit means input, so an output is a cleared bit.
+	return cur&(1<<uint(pin)) == 0, nil
 }
 
 // SetDirection configures a pin as an output (output == true) or input.

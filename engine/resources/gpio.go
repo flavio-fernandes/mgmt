@@ -105,8 +105,9 @@ func (obj *GPIORes) Validate() error {
 	return nil
 }
 
-// Init runs some startup code for this resource. It opens the bridge, verifies
-// and initializes the expander, and configures our pin as an output.
+// Init runs some startup code for this resource. It opens the bridge and does a
+// read-only check that the expander is present. It deliberately does not change
+// any GPIO state: all pin configuration and output writes happen in CheckApply.
 func (obj *GPIORes) Init(init *engine.Init) error {
 	obj.init = init // save for later
 
@@ -114,19 +115,17 @@ func (obj *GPIORes) Init(init *engine.Init) error {
 	if err != nil {
 		return errwrap.Wrapf(err, "could not open gpio bridge")
 	}
+	// Setting the bridge's I2C bus speed is transport configuration; it does
+	// not touch any GPIO pin state on the expander.
 	if err := mcp.SetSpeed(mcp2221.DefaultSpeed); err != nil {
 		mcp.Close()
 		return errwrap.Wrapf(err, "could not configure i2c bus")
 	}
 
 	aw := aw9523.New(mcp, obj.address())
-	if err := aw.Init(); err != nil {
+	if err := aw.CheckID(); err != nil { // read-only presence check
 		mcp.Close()
-		return errwrap.Wrapf(err, "could not initialize aw9523")
-	}
-	if err := aw.SetDirection(obj.Pin, true); err != nil { // output
-		mcp.Close()
-		return errwrap.Wrapf(err, "could not set pin direction")
+		return errwrap.Wrapf(err, "could not find aw9523")
 	}
 
 	obj.mcp = mcp
@@ -157,15 +156,34 @@ func (obj *GPIORes) Watch(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// CheckApply reads the pin's current output state and, if it differs from the
-// desired value and apply is true, writes the desired value.
+// CheckApply ensures the pin is configured as an output driving the desired
+// value. It only changes hardware state when apply is true, and it touches only
+// this pin (plus, when driving a port 0 pin high, the port's push-pull mode);
+// all other pins are left untouched.
 func (obj *GPIORes) CheckApply(ctx context.Context, apply bool) (bool, error) {
-	cur, err := obj.aw.GetOutput(obj.Pin)
+	// Port 0 outputs must be push-pull to actively source current (drive
+	// high); port 1 is open-drain only, and driving low never needs it.
+	needPushPull := obj.Value && obj.Pin < aw9523.PinsPerPort
+
+	isOutput, err := obj.aw.GetDirection(obj.Pin)
+	if err != nil {
+		return false, errwrap.Wrapf(err, "could not read pin direction")
+	}
+	pushPullOK := true
+	if needPushPull {
+		if pushPullOK, err = obj.aw.GetPort0PushPull(); err != nil {
+			return false, errwrap.Wrapf(err, "could not read push-pull mode")
+		}
+	}
+	value, err := obj.aw.GetOutput(obj.Pin)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "could not read pin state")
 	}
-	obj.init.Logf("output of pin %d is %t", obj.Pin, cur)
-	if cur == obj.Value {
+	if obj.init.Debug {
+		obj.init.Logf("pin %d: output=%t value=%t", obj.Pin, isOutput, value)
+	}
+
+	if isOutput && pushPullOK && value == obj.Value {
 		return true, nil // state is already correct
 	}
 
@@ -174,8 +192,22 @@ func (obj *GPIORes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	}
 
 	obj.init.Logf("setting pin %d to %t", obj.Pin, obj.Value)
-	if err := obj.aw.SetOutput(obj.Pin, obj.Value); err != nil {
-		return false, errwrap.Wrapf(err, "could not write pin state")
+	// Write the latch before switching the pin to an output so it never
+	// briefly drives a stale value.
+	if value != obj.Value {
+		if err := obj.aw.SetOutput(obj.Pin, obj.Value); err != nil {
+			return false, errwrap.Wrapf(err, "could not write pin state")
+		}
+	}
+	if needPushPull && !pushPullOK {
+		if err := obj.aw.SetPort0PushPull(true); err != nil {
+			return false, errwrap.Wrapf(err, "could not set push-pull mode")
+		}
+	}
+	if !isOutput {
+		if err := obj.aw.SetDirection(obj.Pin, true); err != nil {
+			return false, errwrap.Wrapf(err, "could not set pin direction")
+		}
 	}
 	return false, nil
 }

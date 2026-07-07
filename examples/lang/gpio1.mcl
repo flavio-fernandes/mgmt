@@ -10,7 +10,7 @@ $mod2 = math.mod($now, 8) == 2
 $mod3 = math.mod($now, 8) == 3
 $mod = $mod0 or $mod1 or $mod2 or $mod3
 
-gpio "led" {
+gpio "led1" {
 	pin => 1,
 	value => $mod,
 	#value => if $mod {
@@ -19,3 +19,8 @@ gpio "led" {
 	#	false
 	#},
 }
+
+#gpio "led2" {
+#	pin => 2,
+#	value => not $mod,
+#}
