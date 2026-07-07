@@ -1,0 +1,9 @@
+import "gpio"
+
+# read the switch on pin 0; gpio.pin polls and sends a new event on each change
+$b = gpio.pin(0)
+
+gpio "led1" { # XXX: name should be dev+pin ?
+	pin => 1,
+	value => $b,
+}
