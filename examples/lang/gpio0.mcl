@@ -1,0 +1,5 @@
+gpio "led" {
+	pin => 1,
+	value => false,
+	#value => true,
+}
