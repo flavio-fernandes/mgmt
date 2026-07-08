@@ -89,8 +89,9 @@ func unrecoverable(state byte) bool {
 // this struct (and therefore its mutex), so every transaction across the whole
 // process is serialized onto the bus.
 type MCP2221 struct {
-	f  *os.File
-	mu sync.Mutex // serializes I2C transactions on this bus
+	f   *os.File
+	mu  sync.Mutex // serializes I2C transactions on this bus
+	rmw sync.Mutex // serializes multi-transaction read-modify-writes
 
 	device string // hidraw path; also the registry key
 	refs   int    // number of open handles sharing us, guarded by registryMu
@@ -354,6 +355,19 @@ func (obj *MCP2221) Read(addr byte, n int) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// Transaction runs f while holding an exclusive lock on the bus, so that a
+// read-modify-write built out of several separate I2C operations is atomic with
+// respect to other callers sharing this same physical bus. The per-operation
+// mutex still serializes each individual Read/Write/WriteRead, so f may freely
+// call them; this second lock only guarantees that no other caller's operations
+// interleave in the middle of f. Without it, two callers each reading a shared
+// register, flipping one bit, and writing it back could clobber each other.
+func (obj *MCP2221) Transaction(f func() error) error {
+	obj.rmw.Lock()
+	defer obj.rmw.Unlock()
+	return f()
 }
 
 // WriteRead writes w and then, using a repeated start, reads n bytes back from

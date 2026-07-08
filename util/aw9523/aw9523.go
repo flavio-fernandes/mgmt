@@ -71,6 +71,13 @@ type I2C interface {
 	Write(addr byte, data []byte) error
 	// WriteRead writes w then reads n bytes back using a repeated start.
 	WriteRead(addr byte, w []byte, n int) ([]byte, error)
+	// Transaction runs f while holding the bus, so that a read-modify-write
+	// spanning several operations is atomic against other callers sharing
+	// this bus. This matters because the AW9523's direction, output and GCR
+	// registers each pack several pins into one register: two callers each
+	// updating a different pin in the same register must not clobber each
+	// other's bit.
+	Transaction(f func() error) error
 }
 
 // AW9523 is a handle to a single expander chip on an I2C bus.
@@ -150,20 +157,22 @@ func (obj *AW9523) GetPort0PushPull() (bool, error) {
 // port's drive mode; it does not alter any pin's direction or output value, and
 // it leaves the other GCR bits untouched.
 func (obj *AW9523) SetPort0PushPull(pushPull bool) error {
-	gcr, err := obj.readReg8(regGCR)
-	if err != nil {
-		return err
-	}
-	next := gcr
-	if pushPull {
-		next |= 1 << 4
-	} else {
-		next &^= 1 << 4
-	}
-	if next == gcr {
-		return nil
-	}
-	return obj.writeReg8(regGCR, next)
+	return obj.bus.Transaction(func() error {
+		gcr, err := obj.readReg8(regGCR)
+		if err != nil {
+			return err
+		}
+		next := gcr
+		if pushPull {
+			next |= 1 << 4
+		} else {
+			next &^= 1 << 4
+		}
+		if next == gcr {
+			return nil
+		}
+		return obj.writeReg8(regGCR, next)
+	})
 }
 
 // validatePin returns an error if pin is out of range.
@@ -193,21 +202,23 @@ func (obj *AW9523) SetDirection(pin int, output bool) error {
 	if err := validatePin(pin); err != nil {
 		return err
 	}
-	cur, err := obj.readReg16(regConfig)
-	if err != nil {
-		return err
-	}
-	// A set config bit means input, so clear the bit to make it an output.
-	next := cur
-	if output {
-		next &^= 1 << uint(pin)
-	} else {
-		next |= 1 << uint(pin)
-	}
-	if next == cur {
-		return nil
-	}
-	return obj.writeReg16(regConfig, next)
+	return obj.bus.Transaction(func() error {
+		cur, err := obj.readReg16(regConfig)
+		if err != nil {
+			return err
+		}
+		// A set config bit means input, so clear the bit for an output.
+		next := cur
+		if output {
+			next &^= 1 << uint(pin)
+		} else {
+			next |= 1 << uint(pin)
+		}
+		if next == cur {
+			return nil
+		}
+		return obj.writeReg16(regConfig, next)
+	})
 }
 
 // SetOutput drives an output pin high (value == true) or low.
@@ -215,20 +226,22 @@ func (obj *AW9523) SetOutput(pin int, value bool) error {
 	if err := validatePin(pin); err != nil {
 		return err
 	}
-	cur, err := obj.readReg16(regOutput)
-	if err != nil {
-		return err
-	}
-	next := cur
-	if value {
-		next |= 1 << uint(pin)
-	} else {
-		next &^= 1 << uint(pin)
-	}
-	if next == cur {
-		return nil
-	}
-	return obj.writeReg16(regOutput, next)
+	return obj.bus.Transaction(func() error {
+		cur, err := obj.readReg16(regOutput)
+		if err != nil {
+			return err
+		}
+		next := cur
+		if value {
+			next |= 1 << uint(pin)
+		} else {
+			next &^= 1 << uint(pin)
+		}
+		if next == cur {
+			return nil
+		}
+		return obj.writeReg16(regOutput, next)
+	})
 }
 
 // GetOutput returns the last value written to an output pin's latch.
