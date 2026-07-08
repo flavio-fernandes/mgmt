@@ -6,12 +6,18 @@ import "gpio"
 #
 #   - button on pin 0  advances the active LED:  1 -> 2 -> ... -> 7 -> 1
 #   - button on pin 11 moves it backward:        1 -> 7 -> ... -> 2 -> 1
-#   - LEDs are on pins 1..6, exactly one lit at a time.
+#   - LEDs are on pins 1..7, exactly one lit at a time.
 #
-# gpio.chaser watches both buttons and returns the active position, 0..5. The
+# gpio.chaser watches both buttons and returns the active position, 0..6. The
 # stateful edge counting (which a declarative expression can't express) lives in
-# that one function; here we just map the position to the six LEDs.
-$active = gpio.chaser(0, 11, 7)
+# that one function; here we just map the position to the LEDs.
+#
+# The 4th argument is an idle timeout in seconds: after that many seconds with no
+# button press, the chaser auto-advances forward one position per second, as if
+# the forward button (pin 0) were being tapped, until a real press takes over
+# again. Pass 0 to disable. This stateful timing also lives in the function, for
+# the same reason the edge counting does.
+$active = gpio.chaser(0, 11, 7, 10)
 
 gpio "led1" {
 	pin => 1,

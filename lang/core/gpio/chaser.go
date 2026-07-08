@@ -51,6 +51,11 @@ const (
 	chaserArgNameForward  = "forward"
 	chaserArgNameBackward = "backward"
 	chaserArgNameCount    = "count"
+	chaserArgNameIdle     = "idle"
+
+	// chaserAutoInterval is how often we auto-advance the index once the idle
+	// timeout has elapsed. It mirrors "press the forward button once a second".
+	chaserAutoInterval = 1 * time.Second
 
 	// chaserPollInterval is how often we re-read the two button pins to
 	// notice a press. The MCP2221 has no interrupt line, so we poll. It has
@@ -75,6 +80,7 @@ type chaserConfig struct {
 	forward  int
 	backward int
 	count    int
+	idle     int // seconds of no press before auto-advancing; 0 disables it
 }
 
 // ChaserFunc implements the classic one-of-N "chaser" position selector on top
@@ -85,6 +91,13 @@ type chaserConfig struct {
 // moves it backward (wrapping 0 -> count-1). It emits a new event whenever the
 // index changes, so a caller can, for example, light exactly one of a row of
 // LEDs.
+//
+// If the idle argument is greater than zero, then after that many seconds with
+// no button press the selector auto-advances forward one position per second,
+// as if the forward button were being tapped, until a real press resumes manual
+// control. This stateful timing lives here for the same reason the edge
+// counting does: a declarative mcl expression can't express it without fighting
+// the reactive engine.
 //
 // This is the stateful counterpart to the pin function: a purely declarative
 // mcl expression cannot keep a running counter that reacts to button *edges*,
@@ -114,12 +127,13 @@ type ChaserFunc struct {
 
 	// state, mutated only by Stream, read by Call under mutex.
 	mutex          sync.Mutex
-	index          int   // the currently selected position, 0..count-1
-	publishedIndex int   // the last index we emitted an event for
-	lastFwd        *bool // last level seen on the forward button
-	lastBwd        *bool // last level seen on the backward button
-	lastPress      time.Time
-	emitted        bool // have we published the current index at least once?
+	index          int       // the currently selected position, 0..count-1
+	publishedIndex int       // the last index we emitted an event for
+	lastFwd        *bool     // last level seen on the forward button
+	lastBwd        *bool     // last level seen on the backward button
+	lastPress      time.Time // last time a real button press was counted
+	lastAuto       time.Time // last time we auto-advanced while idle
+	emitted        bool      // have we published the current index at least once?
 }
 
 // String returns a simple name for this function. This is needed so this struct
@@ -130,7 +144,7 @@ func (obj *ChaserFunc) String() string {
 
 // ArgGen returns the Nth arg name for this function.
 func (obj *ChaserFunc) ArgGen(index int) (string, error) {
-	seq := []string{chaserArgNameForward, chaserArgNameBackward, chaserArgNameCount}
+	seq := []string{chaserArgNameForward, chaserArgNameBackward, chaserArgNameCount, chaserArgNameIdle}
 	if l := len(seq); index >= l {
 		return "", fmt.Errorf("index %d exceeds arg length of %d", index, l)
 	}
@@ -149,7 +163,7 @@ func (obj *ChaserFunc) Info() *interfaces.Info {
 		Memo: false,
 		Fast: false,
 		Spec: false,
-		Sig:  types.NewType(fmt.Sprintf("func(%s int, %s int, %s int) int", chaserArgNameForward, chaserArgNameBackward, chaserArgNameCount)),
+		Sig:  types.NewType(fmt.Sprintf("func(%s int, %s int, %s int, %s int) int", chaserArgNameForward, chaserArgNameBackward, chaserArgNameCount, chaserArgNameIdle)),
 	}
 }
 
@@ -210,7 +224,10 @@ func (obj *ChaserFunc) Stream(ctx context.Context) error {
 			obj.index = 0
 			obj.lastFwd = nil
 			obj.lastBwd = nil
-			obj.lastPress = time.Time{}
+			// Start the idle countdown now, so we don't treat the
+			// zero time as "idle forever" and auto-advance at once.
+			obj.lastPress = time.Now()
+			obj.lastAuto = time.Time{}
 			obj.emitted = false
 			obj.mutex.Unlock()
 
@@ -289,6 +306,8 @@ func (obj *ChaserFunc) poll(config chaserConfig) (bool, error) {
 	obj.lastFwd = &fwd
 	obj.lastBwd = &bwd
 
+	obj.autoAdvance(config, time.Now())
+
 	if obj.emitted && obj.index == obj.publishedIndex {
 		return false, nil // nothing new to publish
 	}
@@ -297,15 +316,37 @@ func (obj *ChaserFunc) poll(config chaserConfig) (bool, error) {
 	return true, nil
 }
 
+// autoAdvance steps the index forward while the selector is idle, as if the
+// forward button were being tapped once per chaserAutoInterval. It is called
+// once per poll, with obj.mutex already held; now is passed in so that it can
+// be unit tested without real time. It deliberately never touches lastPress, so
+// an auto-advance doesn't reset its own idle timer; only a real press does
+// that.
+func (obj *ChaserFunc) autoAdvance(config chaserConfig, now time.Time) {
+	if config.idle <= 0 {
+		return // auto-advance disabled
+	}
+	if now.Sub(obj.lastPress) < time.Duration(config.idle)*time.Second {
+		obj.lastAuto = time.Time{} // not idle yet; reset for next time
+		return
+	}
+	// Idle: step forward at most once per interval.
+	if obj.lastAuto.IsZero() || now.Sub(obj.lastAuto) >= chaserAutoInterval {
+		obj.index = (obj.index + 1) % config.count
+		obj.lastAuto = now
+	}
+}
+
 // Call this function with the input args and return the value if it is possible
 // to do so at this time.
 func (obj *ChaserFunc) Call(ctx context.Context, args []types.Value) (types.Value, error) {
-	if len(args) < 3 {
+	if len(args) < 4 {
 		return nil, fmt.Errorf("not enough args")
 	}
 	forward := int(args[0].Int())
 	backward := int(args[1].Int())
 	count := int(args[2].Int())
+	idle := int(args[3].Int())
 
 	if forward < 0 || forward >= aw9523.Pins {
 		return nil, fmt.Errorf("forward pin %d out of range (0..%d)", forward, aw9523.Pins-1)
@@ -319,13 +360,16 @@ func (obj *ChaserFunc) Call(ctx context.Context, args []types.Value) (types.Valu
 	if count < 1 {
 		return nil, fmt.Errorf("count must be at least 1, got %d", count)
 	}
+	if idle < 0 {
+		return nil, fmt.Errorf("idle must be at least 0, got %d", idle)
+	}
 
 	// Check before we send to a chan where we'd need Stream to be running.
 	if obj.init == nil {
 		return nil, funcs.ErrCantSpeculate
 	}
 
-	config := chaserConfig{forward: forward, backward: backward, count: count}
+	config := chaserConfig{forward: forward, backward: backward, count: count, idle: idle}
 
 	// Tell the Stream which config we're watching now. This doesn't block
 	// for long because Stream should always be ready to consume unless it's
