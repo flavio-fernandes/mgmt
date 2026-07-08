@@ -1,0 +1,43 @@
+import "gpio"
+
+# AW9523 LED chaser, driven by two buttons over an MCP2221 USB to I2C bridge.
+# See junk/aw9523.md for the wiring. This is the mgmt equivalent of the
+# reference aw9523_button_chaser.py.
+#
+#   - button on pin 0  advances the active LED:  1 -> 2 -> ... -> 7 -> 1
+#   - button on pin 11 moves it backward:        1 -> 7 -> ... -> 2 -> 1
+#   - LEDs are on pins 1..6, exactly one lit at a time.
+#
+# gpio.chaser watches both buttons and returns the active position, 0..5. The
+# stateful edge counting (which a declarative expression can't express) lives in
+# that one function; here we just map the position to the six LEDs.
+$active = gpio.chaser(0, 11, 7)
+
+gpio "led1" {
+	pin => 1,
+	value => $active != 0,
+}
+gpio "led2" {
+	pin => 2,
+	value => $active != 1,
+}
+gpio "led3" {
+	pin => 3,
+	value => $active != 2,
+}
+gpio "led4" {
+	pin => 4,
+	value => $active != 3,
+}
+gpio "led5" {
+	pin => 5,
+	value => $active != 4,
+}
+gpio "led6" {
+	pin => 6,
+	value => $active != 5,
+}
+gpio "led7" {
+	pin => 7,
+	value => $active != 6,
+}
