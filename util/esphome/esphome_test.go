@@ -779,6 +779,53 @@ func TestSessionPersistentAsyncDisconnectRecordsCause(t *testing.T) {
 	}
 }
 
+func TestSessionPersistentAsyncDisconnectMarksDisconnectedBeforeLogging(t *testing.T) {
+	factory := &fakeFactory{}
+	session := testSession(t, factory)
+	t.Cleanup(session.Release)
+
+	logStarted := make(chan struct{}, 1)
+	releaseLog := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockLog := func() {
+		releaseOnce.Do(func() { close(releaseLog) })
+	}
+	defer unblockLog()
+
+	info := &ConnInfo{
+		Host: "fake-device.local", Port: DefaultPort,
+		ConnectLogf: func(format string, v ...interface{}) {
+			select {
+			case logStarted <- struct{}{}:
+			default:
+			}
+			<-releaseLog
+		},
+	}
+	session.Configure(info)
+	waitFor(t, "connect", session.Connected)
+
+	factory.driver(0).fail(&testCauseError{stage: "blocked-log"})
+	select {
+	case <-logStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the disconnect logger")
+	}
+
+	// A caller-supplied logger may block. Health and the typed cause must be
+	// published before invoking it so reconnection state never depends on
+	// logging progress.
+	if session.Connected() {
+		t.Fatal("dead connection remained healthy while ConnectLogf was blocked")
+	}
+	var target *testCauseError
+	if err := session.LastError(); !errors.As(err, &target) || target.stage != "blocked-log" {
+		t.Fatalf("close reason was not recorded before logging: %v", err)
+	}
+
+	unblockLog()
+}
+
 func TestSessionQueueOverflowCauseIsRecognizable(t *testing.T) {
 	// A slow mgmt consumer ends the connection with ErrEventQueueFull. That
 	// is actionable configuration feedback, so the sentinel must stay

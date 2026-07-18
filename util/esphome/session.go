@@ -716,14 +716,19 @@ func (obj *Session) asyncCloseReason(d driver) error {
 	return d.closeReason()
 }
 
-// connectionLost records and reports one connection that died on its own after
-// it had connected successfully. It keeps the typed cause in the chain so
-// LastError and WaitConnected callers can reach it with errors.Is/errors.As.
-// The message names the target address but never the noise key.
+// connectionLost atomically records one connection that died on its own and
+// marks it disconnected before invoking the external logging callback. It
+// keeps the typed cause in the chain so LastError and WaitConnected callers can
+// reach it with errors.Is/errors.As. The message names the target address but
+// never the noise key.
 func (obj *Session) connectionLost(info *ConnInfo, reason error) {
 	wrapped := fmt.Errorf("connection to %s lost: %w", info.Addr(), reason)
 	obj.mutex.Lock()
 	obj.lastErr = wrapped
+	if obj.connected {
+		obj.lastAlive = time.Now()
+		obj.connected = false
+	}
 	obj.notifySend()
 	obj.mutex.Unlock()
 
@@ -829,6 +834,7 @@ func (obj *Session) persistent(info *ConnInfo, generation uint64) {
 		case <-d.done(): // connection dropped
 			if reason := obj.asyncCloseReason(d); reason != nil {
 				obj.connectionLost(info, reason)
+				return
 			}
 			obj.markDisconnected()
 			return
@@ -873,7 +879,6 @@ func (obj *Session) pollCycle(info *ConnInfo, generation uint64) {
 	if reason := obj.asyncCloseReason(d); reason != nil {
 		d.close()
 		obj.connectionLost(info, reason)
-		obj.markDisconnected()
 		return
 	}
 
