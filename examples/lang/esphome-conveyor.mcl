@@ -23,11 +23,24 @@
 #     SCL: CircuitPython board.SCL -> FeatherS2 GPIO9
 #     address: 0x70
 #   APDS9960 sensors:
-#     entry sensor: TCA9548A channel 0, address 0x39
-#     exit sensor:  TCA9548A channel 1, address 0x39
+#     entry sensor: TCA9548A channel 0, address 0x39, proximity only
+#     exit sensor:  TCA9548A channel 1, address 0x39, proximity and RGBC
 #   FeatherS2 onboard APA102:
 #     data:  GPIO40
 #     clock: GPIO45
+#
+# Color calibration notes:
+#   The exact FeatherS2 and exit APDS9960 were bench-tested with proximity and
+#   color enabled together, gesture disabled, 4x color gain, and 72 integration
+#   cycles (about 200ms). Red and blue LEGO samples separated reliably once the
+#   object was close to the sensor. Green and yellow are intentionally reported
+#   as unknown until more calibration data is collected.
+#
+#   ESPHome's APDS9960 component reports each color channel as ADC/65535*100,
+#   not as an RGB mixture, and currently initializes ATIME to 0xDB (about 103ms).
+#   The boot lambda below overrides the exit sensor ATIME to 0xB8, matching the
+#   successful 72-cycle CircuitPython test. mgmt normalizes R/G/B by R+G+B
+#   before applying the conservative red/blue classification thresholds.
 #
 # Put wifi_ssid and wifi_password in ESPHome's secrets.yaml, replace the public
 # sample API key in both files, then validate before flashing:
@@ -51,6 +64,16 @@
 #       - output.turn_off: motor_sleep
 #       - fan.turn_off: conveyor_motor
 #       - light.turn_off: status_light
+#       # ESPHome currently sets APDS9960 ATIME=0xDB (~103ms). The bench test
+#       # that cleanly separated red and blue used 72 x 2.78ms ~= 200ms, which
+#       # corresponds to ATIME=256-72=184=0xB8. Apply that only to the exit
+#       # sensor after the APDS9960 component has completed setup.
+#       - lambda: |-
+#           if (!id(exit_apds).write_byte(0x81, 0xB8)) {
+#             ESP_LOGW("conveyor", "Failed to set exit APDS9960 color integration to 200ms");
+#           } else {
+#             ESP_LOGI("conveyor", "Exit APDS9960 color integration set to 200ms");
+#           }
 #
 # esp32:
 #   board: um_feathers2
@@ -107,14 +130,14 @@
 #       - bus_id: exit_i2c
 #         channel: 1
 #
-# # Keep the 100ms hub interval for responsive proximity detection. Color
-# # publications are independently presence-gated and throttled below.
+# # Keep a 100ms polling interval so proximity remains responsive. The exit
+# # APDS9960 runs proximity and color together, exactly as in the successful
+# # CircuitPython experiment. No gesture entities are configured.
 # apds9960:
 #   - id: entry_apds
 #     i2c_id: entry_i2c
 #     address: 0x39
 #     update_interval: 100ms
-#     ambient_light_gain: 4x
 #   - id: exit_apds
 #     i2c_id: exit_i2c
 #     address: 0x39
@@ -122,55 +145,12 @@
 #     ambient_light_gain: 4x
 #
 # sensor:
+#   # The entry sensor is intentionally proximity-only.
 #   - platform: apds9960
 #     apds9960_id: entry_apds
 #     type: PROXIMITY
 #     id: entry_proximity
 #     name: Entry Proximity
-#
-#   # RGB/C values are useful only while an object is in the sensing window.
-#   # Returning an empty optional suppresses publication while no entry object
-#   # is present. Throttling limits active color telemetry to 4Hz per channel.
-#   - platform: apds9960
-#     apds9960_id: entry_apds
-#     type: RED
-#     id: entry_red
-#     name: Entry Red
-#     filters:
-#       - lambda: |-
-#           if (!id(entry_object_present).state) return {};
-#           return x;
-#       - throttle: 250ms
-#   - platform: apds9960
-#     apds9960_id: entry_apds
-#     type: GREEN
-#     id: entry_green
-#     name: Entry Green
-#     filters:
-#       - lambda: |-
-#           if (!id(entry_object_present).state) return {};
-#           return x;
-#       - throttle: 250ms
-#   - platform: apds9960
-#     apds9960_id: entry_apds
-#     type: BLUE
-#     id: entry_blue
-#     name: Entry Blue
-#     filters:
-#       - lambda: |-
-#           if (!id(entry_object_present).state) return {};
-#           return x;
-#       - throttle: 250ms
-#   - platform: apds9960
-#     apds9960_id: entry_apds
-#     type: CLEAR
-#     id: entry_clear
-#     name: Entry Clear
-#     filters:
-#       - lambda: |-
-#           if (!id(entry_object_present).state) return {};
-#           return x;
-#       - throttle: 250ms
 #
 #   - platform: apds9960
 #     apds9960_id: exit_apds
@@ -178,7 +158,11 @@
 #     id: exit_proximity
 #     name: Exit Proximity
 #
-#   # Apply the same publication policy to the exit color channels.
+#   # ESPHome scales each APDS9960 color ADC channel independently to a
+#   # percentage of 65535. These are not RGB-mix percentages. Only publish
+#   # RGBC after the object has stopped in the close-range capture window and
+#   # a full 200ms integration has had time to complete. Throttle active color
+#   # telemetry to 4Hz per channel.
 #   - platform: apds9960
 #     apds9960_id: exit_apds
 #     type: RED
@@ -186,7 +170,7 @@
 #     name: Exit Red
 #     filters:
 #       - lambda: |-
-#           if (!id(exit_object_present).state) return {};
+#           if (!id(exit_color_ready).state) return {};
 #           return x;
 #       - throttle: 250ms
 #   - platform: apds9960
@@ -196,7 +180,7 @@
 #     name: Exit Green
 #     filters:
 #       - lambda: |-
-#           if (!id(exit_object_present).state) return {};
+#           if (!id(exit_color_ready).state) return {};
 #           return x;
 #       - throttle: 250ms
 #   - platform: apds9960
@@ -206,7 +190,7 @@
 #     name: Exit Blue
 #     filters:
 #       - lambda: |-
-#           if (!id(exit_object_present).state) return {};
+#           if (!id(exit_color_ready).state) return {};
 #           return x;
 #       - throttle: 250ms
 #   - platform: apds9960
@@ -216,7 +200,7 @@
 #     name: Exit Clear
 #     filters:
 #       - lambda: |-
-#           if (!id(exit_object_present).state) return {};
+#           if (!id(exit_color_ready).state) return {};
 #           return x;
 #       - throttle: 250ms
 #
@@ -228,14 +212,30 @@
 #   - platform: template
 #     id: exit_object_present
 #     name: Exit Object Present
+#     # Keep the original early-presence threshold for telemetry.
 #     lambda: return id(exit_proximity).has_state() && id(exit_proximity).state >= 20.0;
+#   - platform: template
+#     id: exit_capture_position
+#     internal: true
+#     # CircuitPython testing showed red/blue separation becomes dependable at
+#     # close range. 70% is approximately raw proximity 179 on the APDS9960.
+#     lambda: return id(exit_proximity).has_state() && id(exit_proximity).state >= 70.0;
+#   - platform: template
+#     id: exit_color_ready
+#     name: Exit Color Ready
+#     # Stop first, then wait long enough for a fresh ~200ms color integration
+#     # with the LEGO block stationary in the capture window.
+#     lambda: return id(exit_capture_position).state;
+#     filters:
+#       - delayed_on: 250ms
 #   - platform: template
 #     id: conveyor_run_request
 #     name: Conveyor Run Request
-#     # Latch an entry detection until the object reaches the exit. Returning
-#     # an empty optional keeps the last published value between those events.
+#     # Latch an entry detection until the object reaches the close-range exit
+#     # capture position. Returning an empty optional keeps the last published
+#     # value between those events.
 #     lambda: |-
-#       if (id(exit_object_present).state) return false;
+#       if (id(exit_capture_position).state) return false;
 #       if (id(entry_object_present).state) return true;
 #       return {};
 #
@@ -349,37 +349,67 @@ $light = "Status Light"
 
 $entry_present = esphome.binary_sensor($endpoint, "Entry Object Present")
 $exit_present = esphome.binary_sensor($endpoint, "Exit Object Present")
+$color_ready = esphome.binary_sensor($endpoint, "Exit Color Ready")
 $run_request = esphome.binary_sensor($endpoint, "Conveyor Run Request")
-$red = esphome.sensor($endpoint, "Entry Red")
-$green = esphome.sensor($endpoint, "Entry Green")
-$blue = esphome.sensor($endpoint, "Entry Blue")
-$clear = esphome.sensor($endpoint, "Entry Clear")
+$red = esphome.sensor($endpoint, "Exit Red")
+$green = esphome.sensor($endpoint, "Exit Green")
+$blue = esphome.sensor($endpoint, "Exit Blue")
+$clear = esphome.sensor($endpoint, "Exit Clear")
 
-# Show the object's dominant measured color while it is at the entry sensor.
-# Named colors and an exact #RRGGBB value both exercise esphome:light's stable
-# color contract. Blue means idle, green means arrived, and orange means the
-# sensor sees an object without a clear red/green/blue winner. The clear channel
-# is logged for calibration; choosing the dominant channel remains deliberately
-# simple until readings from the assembled conveyor are available.
-$status_color = if $exit_present {
-	"green"
+# ESPHome scales every RGBC channel by the same 65535 divisor, so normalizing
+# R/G/B by their sum recreates the raw-channel RGB mix used during the
+# CircuitPython calibration. Only red and blue are classified here because those
+# LEGO samples produced clean, repeatable close-range clusters. Green, yellow,
+# and anything outside the calibrated regions are deliberately "unknown".
+$rgb_total = $red + $green + $blue
+$red_mix = if $rgb_total > 0.0 {
+	$red / $rgb_total
+} else {
+	0.0
+}
+$green_mix = if $rgb_total > 0.0 {
+	$green / $rgb_total
+} else {
+	0.0
+}
+$blue_mix = if $rgb_total > 0.0 {
+	$blue / $rgb_total
+} else {
+	0.0
+}
+
+$detected_color = if $color_ready {
+	if $red_mix >= 0.44 and $green_mix <= 0.27 {
+		"red"
+	} else {
+		if $blue_mix >= 0.39 and $green_mix <= 0.33 {
+			"blue"
+		} else {
+			"unknown"
+		}
+	}
+} else {
+	"none"
+}
+
+# Keep transit and idle colors distinct from the two calibrated object colors.
+# Yellow means the conveyor is carrying an object, white means idle, orange
+# means an object reached the color station but did not match red or blue.
+$status_color = if $color_ready {
+	if $detected_color == "red" {
+		"red"
+	} else {
+		if $detected_color == "blue" {
+			"blue"
+		} else {
+			"orange"
+		}
+	}
 } else {
 	if $entry_present {
-		if $red > $green and $red > $blue {
-			"red"
-		} else {
-			if $green > $red and $green > $blue {
-				"#00ff00"
-			} else {
-				if $blue > $red and $blue > $green {
-					"blue"
-				} else {
-					"orange"
-				}
-			}
-		}
+		"yellow"
 	} else {
-		"blue"
+		"#ffffff"
 	}
 }
 
@@ -417,14 +447,19 @@ esphome:light $light {
 
 print "conveyor telemetry" {
 	msg => fmt.printf(
-		"entry=%v exit=%v run=%v rgbc=(%f, %f, %f, %f) status=%s",
+		"entry=%v exit=%v color-ready=%v run=%v exit-rgbc=(%f, %f, %f, %f) mix=(%f, %f, %f) detected=%s status=%s",
 		$entry_present,
 		$exit_present,
+		$color_ready,
 		$run_request,
 		$red,
 		$green,
 		$blue,
 		$clear,
+		$red_mix,
+		$green_mix,
+		$blue_mix,
+		$detected_color,
 		$status_color,
 	),
 }
